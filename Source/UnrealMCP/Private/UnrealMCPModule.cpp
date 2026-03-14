@@ -11,8 +11,8 @@ IMPLEMENT_MODULE(FUnrealMCPModule, UnrealMCP)
 
 DEFINE_LOG_CATEGORY(LogUnrealMCP);
 
-// ── [UnrealMCP] config: project DefaultEngine.ini (GGameIni) overrides engine ─
-// Port=55557, CommandTimeoutSeconds=30, MaxCommandsPerTick=16
+// ── [UnrealMCP] config: read engine first, then project (GGameIni overrides GEngineIni) ─
+// Port=55557, CommandTimeoutSeconds=30, MaxCommandsPerTick=16, MaxRequestLineBytes, RateLimitEnabled
 static int32 GetConfiguredPort()
 {
 	int32 Port = 55557;

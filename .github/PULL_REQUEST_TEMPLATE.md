@@ -23,3 +23,4 @@ Describe how you tested these changes:
 - [ ] New commands are registered in `DispatchCommand()`
 - [ ] Error handling uses `SetError()` with descriptive messages
 - [ ] All pointers are null-checked before use
+- [ ] CHANGELOG.md updated (if user-facing change)

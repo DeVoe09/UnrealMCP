@@ -17,23 +17,37 @@ Creates a new level (or opens the given one), then runs:
 
 import argparse
 import json
+import os
 import socket
 import sys
 import uuid
+from typing import Optional
 
 DEFAULT_PORT = 55557
-DEFAULT_LEVEL = "/Game/AncestralPlane/Lvl_Hub"
+# Default level: use env UNREALMCP_TEST_LEVEL for your project, or pass --level
+DEFAULT_LEVEL = os.environ.get("UNREALMCP_TEST_LEVEL", "/Game/AncestralPlane/Lvl_Hub")
 TEST_PACKAGE = "/Game/MCPTest"
 TEST_BT_NAME = "MCPTestBT"
 CONTROLLER_LABEL = "MCPTestAIController"
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # 4 MB cap to avoid runaway recv
 
 
-def send_command(sock: socket.socket, cmd_type: str, params: dict | None = None, debug: bool = False) -> dict:
+def send_command(
+    sock: socket.socket,
+    cmd_type: str,
+    params: Optional[dict] = None,
+    debug: bool = False,
+) -> dict:
     req = {"id": str(uuid.uuid4()), "type": cmd_type, "params": params or {}}
     msg = (json.dumps(req) + "\n").encode("utf-8")
     sock.sendall(msg)
     buf = b""
     while b"\n" not in buf:
+        if len(buf) >= MAX_RESPONSE_BYTES:
+            raise ValueError(
+                f"Response exceeded {MAX_RESPONSE_BYTES} bytes without newline. "
+                "Server may be misbehaving or not UnrealMCP."
+            )
         chunk = sock.recv(4096)
         if not chunk:
             raise ConnectionError("Connection closed")
@@ -72,7 +86,7 @@ def main() -> int:
         print("Ensure Unreal Editor is open with the Emo project and MCP server is running.")
         return 1
 
-    def run(name: str, cmd: str, params: dict | None = None) -> bool:
+    def run(name: str, cmd: str, params: Optional[dict] = None) -> bool:
         try:
             r = send_command(sock, cmd, params, debug=debug)
             ok = r.get("success", False)

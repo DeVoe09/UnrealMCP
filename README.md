@@ -32,12 +32,12 @@ Drop it into your project's `Plugins/` folder, enable it, and connect any MCP-co
 
 ### From Source (Plugin Folder)
 
-1. Clone or download this repository into your project's `Plugins/` directory:
+1. Clone or download this repository into your project's `Plugins/` directory (folder name can be `UnrealMCP` or `UnrealMCPPlugin`):
 
 ```
 YourProject/
   Plugins/
-    UnrealMCP/
+    UnrealMCP/          # or UnrealMCPPlugin
       Source/
       UnrealMCP.uplugin
       ...
@@ -315,7 +315,7 @@ RateLimitEnabled=0
 ## Project Structure
 
 ```
-UnrealMCP/
+Plugins/UnrealMCP/   # or UnrealMCPPlugin
 ├── Source/UnrealMCP/
 │   ├── Public/
 │   │   ├── MCPTCPServer.h          # Server class, command queue, protocol

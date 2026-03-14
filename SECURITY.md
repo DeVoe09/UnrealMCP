@@ -8,7 +8,7 @@ UnrealMCP opens a TCP server port (default 55557) on your machine. This is by de
 
 ## Security Considerations
 
-- The TCP server binds to `0.0.0.0` by default, which means it listens on all network interfaces. In shared or public network environments, consider firewall rules to restrict access to `localhost` only.
+- The TCP server binds to `0.0.0.0` by default, which means it listens on all network interfaces. Binding to localhost only (127.0.0.1) is not currently configurable; in shared or public network environments, use firewall rules to restrict access to the host.
 - Commands like `execute_python` and `console_command` allow arbitrary code execution within the editor process. This is a powerful feature but should only be used in trusted environments.
 - Rate limiting is available (disabled by default) to mitigate runaway command loops. Enable it via `RateLimitEnabled=1` in your project's `DefaultEngine.ini`.
 

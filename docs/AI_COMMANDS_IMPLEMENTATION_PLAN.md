@@ -1,5 +1,7 @@
 # AI Commands Implementation Plan
 
+**Status: Implemented as of UnrealMCP 1.1.0.** See README Command Reference — AI for the current command list.
+
 > **For Claude:** Use this plan to implement the AI command set task-by-task. Follow existing patterns in `MCPTCPServer.cpp` (asset creation, graph nodes, property editing).
 
 **Goal:** Extend the MCP from "scene builder" to "gameplay orchestrator" by adding native commands for Behavior Trees, Blackboards, AI Controller/Perception, and Navigation.

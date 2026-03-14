@@ -28,7 +28,7 @@ This project follows [Epic's Coding Standard](https://dev.epicgames.com/document
 - **Command handlers** are named `Cmd_<CommandName>` and take `TSharedPtr<FMCPPendingCommand>&`.
 - **Error handling**: Always call `SetError(Cmd, ...)` with a descriptive message and error code. Never silently ignore failures.
 - **Null safety**: Check pointers before use. Use `IsValid()` for UObjects, null checks for raw pointers.
-- **JSON access**: Use `TryGetStringField` / `TryGetObjectField` (safe) instead of `GetStringField` / `GetObjectField` (asserts on missing keys).
+- **JSON access**: Always use `TryGetStringField`, `TryGetObjectField`, `TryGetNumberField`, etc. (safe). Never use `GetStringField` / `GetObjectField` without checking — they can assert on missing keys.
 
 ## Adding a New Command
 
@@ -36,7 +36,7 @@ This project follows [Epic's Coding Standard](https://dev.epicgames.com/document
 2. Implement it in `MCPTCPServer.cpp` following existing patterns.
 3. Register it in `DispatchCommand()`.
 4. Document it in `README.md`.
-5. Add a test case in `Scripts/`.
+5. Add or extend a test in `Scripts/`: AI-related commands are covered by `Scripts/test_ai_commands.py`; for other domains, add a manual test or a small script (see `Scripts/README.md`).
 
 ## License
 

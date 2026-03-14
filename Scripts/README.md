@@ -9,12 +9,13 @@ End-to-end test for the AI-related MCP commands. Run with **Unreal Editor open**
 ```bash
 # From repo root or plugin folder (Python 3.7+)
 python Plugins/UnrealMCPPlugin/Scripts/test_ai_commands.py
+# If you cloned the repo as UnrealMCP: python Plugins/UnrealMCP/Scripts/test_ai_commands.py
 ```
 
 Options:
 
 - `--port 55557` — MCP TCP port (default: 55557).
-- `--level /Game/AncestralPlane/Lvl_Hub` — Level to open. Used after an optional “new level” attempt; if you only want to open this level, use `--no-new-level`.
+- `--level <path>` — Level to open (default: `UNREALMCP_TEST_LEVEL` env var, or `/Game/AncestralPlane/Lvl_Hub`). Used after an optional “new level” attempt; if you only want to open this level, use `--no-new-level`.
 - `--no-new-level` — Do not try to create a new level via `execute_python`; only open the level given by `--level`.
 
 ### What it tests
