@@ -1,0 +1,44 @@
+# Unreal Engine build artifacts
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+Build/
+
+# IDE / editor files
+.vs/
+.vscode/
+.idea/
+*.sln
+*.suo
+*.vcxproj*
+*.sdf
+*.opensdf
+*.ipch
+*.VC.db
+*.VC.opendb
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Compiled object files
+*.o
+*.obj
+*.pdb
+*.dll
+*.lib
+*.exp
+*.so
+*.dylib

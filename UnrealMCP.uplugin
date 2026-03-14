@@ -1,0 +1,36 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.1.0",
+	"FriendlyName": "Unreal MCP",
+	"Description": "Model Context Protocol (MCP) server plugin for Unreal Engine. Exposes 100+ editor commands over TCP with JSON-RPC 2.0 support, enabling AI assistants like Claude to control the UE Editor programmatically.",
+	"Category": "Editor",
+	"CreatedBy": "UnrealMCP Contributors",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EngineVersion": "5.7.0",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"EnabledByDefault": false,
+	"Plugins": [
+		{
+			"Name": "EditorScriptingUtilities",
+			"Enabled": true
+		},
+		{
+			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		}
+	],
+	"Modules": [
+		{
+			"Name": "UnrealMCP",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	]
+}
