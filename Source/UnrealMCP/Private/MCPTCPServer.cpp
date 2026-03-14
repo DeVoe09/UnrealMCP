@@ -216,7 +216,7 @@
 // FScriptArrayHelper is pulled in transitively via UObject/UnrealType.h (already included above)
 
 // ── Plugin version ───────────────────────────────────────────────────────────
-static const FString UNREALMCP_VERSION = TEXT("2.0.0");
+static const FString UNREALMCP_VERSION = TEXT("2.0.1");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-client connection runnable — runs HandleConnection on its own thread
