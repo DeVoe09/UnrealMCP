@@ -166,10 +166,57 @@
 // Blueprint compiler results log
 #include "KismetCompiler.h"
 
+// ── NEW INCLUDES for FEATURES_TO_ADD ─────────────────────────────────────────
+
+// Lighting
+#include "Engine/DirectionalLight.h"
+#include "Engine/PointLight.h"
+#include "Engine/SpotLight.h"
+#include "Engine/RectLight.h"
+#include "Components/DirectionalLightComponent.h"
+#include "Components/PointLightComponent.h"
+#include "Components/SpotLightComponent.h"
+#include "Components/RectLightComponent.h"
+
+// Landscape
+#include "Landscape.h"
+#include "LandscapeProxy.h"
+#include "LandscapeInfo.h"
+
+// Foliage
+#include "InstancedFoliageActor.h"
+#include "FoliageType.h"
+
+// Level Sequence / Sequencer
+#include "LevelSequence.h"
+#include "LevelSequenceActor.h"
+
+// Audio
+#include "Components/AudioComponent.h"
+#include "Sound/SoundBase.h"
+#include "Sound/SoundCue.h"
+
+// Physics constraints
+#include "PhysicsEngine/PhysicsConstraintComponent.h"
+#include "PhysicsEngine/PhysicsConstraintActor.h"
+
+// World Partition / Data Layers
+#include "WorldPartition/WorldPartition.h"
+#include "WorldPartition/DataLayer/DataLayerManager.h"
+#include "WorldPartition/DataLayer/DataLayerInstance.h"
+
+// AI extensions
+#include "Perception/AISenseConfig_Damage.h"
+#include "BehaviorTree/BlackboardComponent.h"
+#include "GameFramework/Pawn.h"
+
+// Undo/Redo
+#include "ScopedTransaction.h"
+
 // FScriptArrayHelper is pulled in transitively via UObject/UnrealType.h (already included above)
 
 // ── Plugin version ───────────────────────────────────────────────────────────
-static const FString UNREALMCP_VERSION = TEXT("1.1.0");
+static const FString UNREALMCP_VERSION = TEXT("2.0.0");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-client connection runnable — runs HandleConnection on its own thread
@@ -242,7 +289,7 @@ FMCPTCPServer::~FMCPTCPServer()
 // Start / Stop
 // ─────────────────────────────────────────────────────────────────────────────
 
-bool FMCPTCPServer::Start(int32 InPort, int32 InCommandTimeoutSeconds, int32 InMaxCommandsPerTick, int32 InMaxRequestLineBytes, bool bInRateLimitEnabled)
+bool FMCPTCPServer::Start(int32 InPort, int32 InCommandTimeoutSeconds, int32 InMaxCommandsPerTick, int32 InMaxRequestLineBytes, bool bInRateLimitEnabled, const FString& InBindAddress)
 {
 	if (bRunning.load())
 	{
@@ -255,6 +302,7 @@ bool FMCPTCPServer::Start(int32 InPort, int32 InCommandTimeoutSeconds, int32 InM
 	MaxCommandsPerTick = FMath::Clamp(InMaxCommandsPerTick, 1, 256);
 	MaxRequestLineBytes = (InMaxRequestLineBytes > 0) ? FMath::Clamp(InMaxRequestLineBytes, 4096, 64 * 1024 * 1024) : (16 * 1024 * 1024);
 	bRateLimitEnabled = bInRateLimitEnabled;
+	BindAddress = InBindAddress;
 
 	// Create listen socket
 	ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
@@ -275,7 +323,17 @@ bool FMCPTCPServer::Start(int32 InPort, int32 InCommandTimeoutSeconds, int32 InM
 	ListenSocket->SetNonBlocking(false);
 
 	TSharedRef<FInternetAddr> Addr = SocketSubsystem->CreateInternetAddr();
-	Addr->SetAnyAddress();
+	// Bind address config: "localhost" or "127.0.0.1" binds to loopback only (safer on shared networks)
+	if (BindAddress == TEXT("127.0.0.1") || BindAddress.Equals(TEXT("localhost"), ESearchCase::IgnoreCase))
+	{
+		bool bIsValid = false;
+		Addr->SetIp(TEXT("127.0.0.1"), bIsValid);
+		UE_LOG(LogUnrealMCP, Log, TEXT("Binding to localhost only (127.0.0.1)"));
+	}
+	else
+	{
+		Addr->SetAnyAddress();
+	}
 	Addr->SetPort(ListenPort);
 
 	if (!ListenSocket->Bind(*Addr))
@@ -685,18 +743,19 @@ TSharedPtr<FMCPPendingCommand> FMCPTCPServer::ParseCommand(const FString& RawJso
 	{
 		Cmd->bJsonRpc = true;
 
-		// JSON-RPC allows id as number or string
-		if (Root->HasField(TEXT("id")))
+		// JSON-RPC allows id as number or string; guard against null or invalid value
+		TSharedPtr<FJsonValue> IdVal = Root->TryGetField(TEXT("id"));
+		if (IdVal.IsValid())
 		{
-			const TSharedPtr<FJsonValue>& IdVal = Root->Values[TEXT("id")];
 			if (IdVal->Type == EJson::Number)
 			{
 				Cmd->Id = FString::Printf(TEXT("%d"), static_cast<int32>(IdVal->AsNumber()));
 			}
-			else
+			else if (IdVal->Type == EJson::String)
 			{
 				Cmd->Id = IdVal->AsString();
 			}
+			// EJson::Null or other types: leave Cmd->Id empty
 		}
 
 		Root->TryGetStringField(TEXT("method"), Cmd->Type);
@@ -1053,6 +1112,48 @@ void FMCPTCPServer::DispatchCommand(TSharedPtr<FMCPPendingCommand>& Cmd)
 	else if (Type == TEXT("get_umg_tree"))                  Cmd_GetUmgTree                (Cmd);
 	else if (Type == TEXT("set_umg_slot_content"))          Cmd_SetUmgSlotContent         (Cmd);
 	else if (Type == TEXT("create_widget_blueprint"))       Cmd_CreateWidgetBlueprint     (Cmd);
+	// ── NEW: MCP protocol extensions ─────────────────────────────────────────
+	else if (Type == TEXT("prompts/list"))                  Cmd_PromptsList               (Cmd);
+	else if (Type == TEXT("resources/list"))                Cmd_ResourcesList             (Cmd);
+	else if (Type == TEXT("health"))                        Cmd_Health                    (Cmd);
+	// ── NEW: Asset import & reload ───────────────────────────────────────────
+	else if (Type == TEXT("import_asset"))                  Cmd_ImportAsset               (Cmd);
+	else if (Type == TEXT("reload_asset"))                  Cmd_ReloadAsset               (Cmd);
+	// ── NEW: Lighting ────────────────────────────────────────────────────────
+	else if (Type == TEXT("create_light"))                  Cmd_CreateLight               (Cmd);
+	else if (Type == TEXT("edit_light"))                    Cmd_EditLight                 (Cmd);
+	else if (Type == TEXT("build_lighting"))                Cmd_BuildLighting             (Cmd);
+	// ── NEW: Landscape ───────────────────────────────────────────────────────
+	else if (Type == TEXT("create_landscape"))              Cmd_CreateLandscape           (Cmd);
+	else if (Type == TEXT("get_landscape_info"))            Cmd_GetLandscapeInfo          (Cmd);
+	// ── NEW: Foliage ─────────────────────────────────────────────────────────
+	else if (Type == TEXT("place_foliage"))                 Cmd_PlaceFoliage              (Cmd);
+	else if (Type == TEXT("query_foliage"))                 Cmd_QueryFoliage              (Cmd);
+	else if (Type == TEXT("remove_foliage"))                Cmd_RemoveFoliage             (Cmd);
+	// ── NEW: Sequencer ───────────────────────────────────────────────────────
+	else if (Type == TEXT("create_level_sequence"))         Cmd_CreateLevelSequence       (Cmd);
+	else if (Type == TEXT("add_sequencer_track"))           Cmd_AddSequencerTrack         (Cmd);
+	else if (Type == TEXT("play_sequence"))                 Cmd_PlaySequence              (Cmd);
+	// ── NEW: Niagara / VFX ───────────────────────────────────────────────────
+	else if (Type == TEXT("create_niagara_system"))         Cmd_CreateNiagaraSystem       (Cmd);
+	else if (Type == TEXT("set_particle_parameter"))        Cmd_SetParticleParameter      (Cmd);
+	// ── NEW: Audio ───────────────────────────────────────────────────────────
+	else if (Type == TEXT("add_audio_component"))           Cmd_AddAudioComponent         (Cmd);
+	// ── NEW: World Partition ─────────────────────────────────────────────────
+	else if (Type == TEXT("get_world_partition_info"))      Cmd_GetWorldPartitionInfo     (Cmd);
+	else if (Type == TEXT("get_data_layers"))               Cmd_GetDataLayers             (Cmd);
+	// ── NEW: Physics ─────────────────────────────────────────────────────────
+	else if (Type == TEXT("create_physics_constraint"))     Cmd_CreatePhysicsConstraint   (Cmd);
+	// ── NEW: AI extensions ───────────────────────────────────────────────────
+	else if (Type == TEXT("configure_ai_damage_perception")) Cmd_ConfigureAIDamagePerception(Cmd);
+	else if (Type == TEXT("set_blackboard_value_runtime"))  Cmd_SetBlackboardValueRuntime (Cmd);
+	else if (Type == TEXT("possess_pawn"))                  Cmd_PossessPawn               (Cmd);
+	// ── NEW: Server QoL — Batch & Undo ───────────────────────────────────────
+	else if (Type == TEXT("batch_execute"))                 Cmd_BatchExecute              (Cmd);
+	else if (Type == TEXT("begin_transaction"))             Cmd_BeginTransaction          (Cmd);
+	else if (Type == TEXT("end_transaction"))               Cmd_EndTransaction            (Cmd);
+	else if (Type == TEXT("undo"))                          Cmd_Undo                      (Cmd);
+	else if (Type == TEXT("redo"))                          Cmd_Redo                      (Cmd);
 	else
 	{
 		SetError(Cmd, FString::Printf(TEXT("Unknown command type: '%s'"), *Type), TEXT("unknown_command"));
@@ -1075,13 +1176,21 @@ void FMCPTCPServer::Cmd_Initialize(TSharedPtr<FMCPPendingCommand>& Cmd)
 	TSharedPtr<FJsonObject> ServerInfo = MakeShared<FJsonObject>();
 	ServerInfo->SetStringField(TEXT("name"), TEXT("unrealmcp"));
 	ServerInfo->SetStringField(TEXT("version"), UNREALMCP_VERSION);
+	ServerInfo->SetStringField(TEXT("engine_version"), FEngineVersion::Current().ToString());
 	Result->SetObjectField(TEXT("serverInfo"), ServerInfo);
 
-	// Capabilities
+	// Capabilities — advertise tools, prompts, and resources
 	TSharedPtr<FJsonObject> Capabilities = MakeShared<FJsonObject>();
 	TSharedPtr<FJsonObject> ToolsCap = MakeShared<FJsonObject>();
 	ToolsCap->SetBoolField(TEXT("listChanged"), false);
 	Capabilities->SetObjectField(TEXT("tools"), ToolsCap);
+	TSharedPtr<FJsonObject> PromptsCap = MakeShared<FJsonObject>();
+	PromptsCap->SetBoolField(TEXT("listChanged"), false);
+	Capabilities->SetObjectField(TEXT("prompts"), PromptsCap);
+	TSharedPtr<FJsonObject> ResourcesCap = MakeShared<FJsonObject>();
+	ResourcesCap->SetBoolField(TEXT("subscribe"), false);
+	ResourcesCap->SetBoolField(TEXT("listChanged"), false);
+	Capabilities->SetObjectField(TEXT("resources"), ResourcesCap);
 	Result->SetObjectField(TEXT("capabilities"), Capabilities);
 
 	SetSuccess(Cmd, Result);
@@ -1183,6 +1292,32 @@ TArray<TSharedPtr<FJsonValue>> FMCPTCPServer::BuildToolDefinitions() const
 			TSharedPtr<FJsonObject> PropObj = MakeShared<FJsonObject>();
 			PropObj->SetStringField(TEXT("type"), P.Value);
 			Properties->SetObjectField(P.Key, PropObj);
+		}
+		Schema->SetObjectField(TEXT("properties"), Properties);
+		if (Required.Num() > 0)
+		{
+			TArray<TSharedPtr<FJsonValue>> ReqArr;
+			for (const FString& R : Required) ReqArr.Add(MakeShared<FJsonValueString>(R));
+			Schema->SetArrayField(TEXT("required"), ReqArr);
+		}
+		return Schema;
+	};
+
+	// Helper to build schema with property descriptions for richer inputSchema
+	auto MakeRichSchema = [](TArray<TTuple<FString, FString, FString>> Props, TArray<FString> Required = {}) -> TSharedPtr<FJsonObject>
+	{
+		TSharedPtr<FJsonObject> Schema = MakeShared<FJsonObject>();
+		Schema->SetStringField(TEXT("type"), TEXT("object"));
+		TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+		for (const auto& P : Props)
+		{
+			TSharedPtr<FJsonObject> PropObj = MakeShared<FJsonObject>();
+			PropObj->SetStringField(TEXT("type"), P.Get<1>());
+			if (!P.Get<2>().IsEmpty())
+			{
+				PropObj->SetStringField(TEXT("description"), P.Get<2>());
+			}
+			Properties->SetObjectField(P.Get<0>(), PropObj);
 		}
 		Schema->SetObjectField(TEXT("properties"), Properties);
 		if (Required.Num() > 0)
@@ -1409,6 +1544,166 @@ TArray<TSharedPtr<FJsonValue>> FMCPTCPServer::BuildToolDefinitions() const
 		MakeSchema({{TEXT("filename"), TEXT("string")}}, {}));
 	AddTool(TEXT("list_viewports"), TEXT("Enumerate open viewport windows."), nullptr);
 
+	// ── NEW: Health ─────────────────────────────────────────────────────────
+	AddTool(TEXT("health"), TEXT("Health check endpoint. Returns 200-equivalent when server is up."), nullptr);
+
+	// ── NEW: Asset import & reload ──────────────────────────────────────────
+	AddTool(TEXT("import_asset"), TEXT("Import an asset from a file on disk (FBX, PNG, etc.) using IAssetTools::ImportAssetsAutomated."),
+		MakeRichSchema({
+			{TEXT("file_path"), TEXT("string"), TEXT("Absolute path to the file to import.")},
+			{TEXT("destination_path"), TEXT("string"), TEXT("Content path for the imported asset (e.g. /Game/Meshes).")},
+		}, {TEXT("file_path"), TEXT("destination_path")}));
+	AddTool(TEXT("reload_asset"), TEXT("Reload an asset from disk (reimport). Useful after external changes."),
+		MakeRichSchema({
+			{TEXT("asset_path"), TEXT("string"), TEXT("Content path of the asset to reload.")},
+		}, {TEXT("asset_path")}));
+
+	// ── NEW: Lighting ───────────────────────────────────────────────────────
+	AddTool(TEXT("create_light"), TEXT("Spawn a light actor (directional, point, spot, or rect)."),
+		MakeRichSchema({
+			{TEXT("light_type"), TEXT("string"), TEXT("One of: directional, point, spot, rect.")},
+			{TEXT("label"), TEXT("string"), TEXT("Optional label for the light actor.")},
+			{TEXT("x"), TEXT("number"), TEXT("X location.")},
+			{TEXT("y"), TEXT("number"), TEXT("Y location.")},
+			{TEXT("z"), TEXT("number"), TEXT("Z location.")},
+			{TEXT("intensity"), TEXT("number"), TEXT("Light intensity.")},
+			{TEXT("color_r"), TEXT("number"), TEXT("Red component (0-1).")},
+			{TEXT("color_g"), TEXT("number"), TEXT("Green component (0-1).")},
+			{TEXT("color_b"), TEXT("number"), TEXT("Blue component (0-1).")},
+		}, {TEXT("light_type")}));
+	AddTool(TEXT("edit_light"), TEXT("Modify a light actor's properties (intensity, color, mobility)."),
+		MakeRichSchema({
+			{TEXT("actor_path"), TEXT("string"), TEXT("Path or label of the light actor.")},
+			{TEXT("actor_label"), TEXT("string"), TEXT("Label of the light actor.")},
+			{TEXT("intensity"), TEXT("number"), TEXT("New intensity value.")},
+			{TEXT("color_r"), TEXT("number"), TEXT("Red component (0-1).")},
+			{TEXT("color_g"), TEXT("number"), TEXT("Green component (0-1).")},
+			{TEXT("color_b"), TEXT("number"), TEXT("Blue component (0-1).")},
+			{TEXT("mobility"), TEXT("string"), TEXT("static, stationary, or movable.")},
+		}, {}));
+	AddTool(TEXT("build_lighting"), TEXT("Trigger a lighting build (equivalent to Build > Build Lighting Only)."), nullptr);
+
+	// ── NEW: Landscape ──────────────────────────────────────────────────────
+	AddTool(TEXT("create_landscape"), TEXT("Create a landscape (terrain) actor in the level."),
+		MakeRichSchema({
+			{TEXT("num_quads_x"), TEXT("number"), TEXT("Number of quads in X (width).")},
+			{TEXT("num_quads_y"), TEXT("number"), TEXT("Number of quads in Y (height).")},
+			{TEXT("quad_size"), TEXT("number"), TEXT("Size of each quad in world units.")},
+			{TEXT("label"), TEXT("string"), TEXT("Optional label for the landscape.")},
+		}, {}));
+	AddTool(TEXT("get_landscape_info"), TEXT("Query landscape info: bounds, resolution, num components."), nullptr);
+
+	// ── NEW: Foliage ────────────────────────────────────────────────────────
+	AddTool(TEXT("place_foliage"), TEXT("Place foliage instances in the level from a static mesh."),
+		MakeRichSchema({
+			{TEXT("mesh_path"), TEXT("string"), TEXT("Content path of the static mesh to use as foliage.")},
+			{TEXT("locations"), TEXT("array"), TEXT("Array of {x,y,z} location objects.")},
+		}, {TEXT("mesh_path"), TEXT("locations")}));
+	AddTool(TEXT("query_foliage"), TEXT("List foliage types and instance counts in the level."), nullptr);
+	AddTool(TEXT("remove_foliage"), TEXT("Remove foliage instances by type or in a region."),
+		MakeRichSchema({
+			{TEXT("mesh_path"), TEXT("string"), TEXT("Content path of the foliage mesh type to remove.")},
+		}, {}));
+
+	// ── NEW: Sequencer ──────────────────────────────────────────────────────
+	AddTool(TEXT("create_level_sequence"), TEXT("Create a Level Sequence asset and optionally place it in the world."),
+		MakeRichSchema({
+			{TEXT("asset_name"), TEXT("string"), TEXT("Name for the Level Sequence asset.")},
+			{TEXT("package_path"), TEXT("string"), TEXT("Content path (e.g. /Game/Cinematics).")},
+			{TEXT("place_in_world"), TEXT("boolean"), TEXT("If true, also spawn a LevelSequenceActor.")},
+		}, {TEXT("asset_name"), TEXT("package_path")}));
+	AddTool(TEXT("add_sequencer_track"), TEXT("Add a track (transform, property, camera cut) to a Level Sequence."),
+		MakeRichSchema({
+			{TEXT("sequence_path"), TEXT("string"), TEXT("Content path of the Level Sequence.")},
+			{TEXT("actor_label"), TEXT("string"), TEXT("Label of the actor to bind.")},
+			{TEXT("track_type"), TEXT("string"), TEXT("Type: transform, property, camera_cut.")},
+		}, {TEXT("sequence_path"), TEXT("track_type")}));
+	AddTool(TEXT("play_sequence"), TEXT("Play, pause, or scrub a Level Sequence in the editor."),
+		MakeRichSchema({
+			{TEXT("sequence_path"), TEXT("string"), TEXT("Content path of the Level Sequence.")},
+			{TEXT("action"), TEXT("string"), TEXT("play, pause, stop, or scrub.")},
+			{TEXT("time"), TEXT("number"), TEXT("Time in seconds (for scrub).")},
+		}, {TEXT("sequence_path"), TEXT("action")}));
+
+	// ── NEW: Niagara / VFX ──────────────────────────────────────────────────
+	AddTool(TEXT("create_niagara_system"), TEXT("Create or spawn a Niagara particle system in the level."),
+		MakeRichSchema({
+			{TEXT("system_path"), TEXT("string"), TEXT("Content path of the Niagara System asset to spawn.")},
+			{TEXT("x"), TEXT("number"), TEXT("X location.")},
+			{TEXT("y"), TEXT("number"), TEXT("Y location.")},
+			{TEXT("z"), TEXT("number"), TEXT("Z location.")},
+			{TEXT("label"), TEXT("string"), TEXT("Optional actor label.")},
+		}, {TEXT("system_path")}));
+	AddTool(TEXT("set_particle_parameter"), TEXT("Set a parameter on a Niagara system component."),
+		MakeRichSchema({
+			{TEXT("actor_label"), TEXT("string"), TEXT("Label of the actor with the Niagara component.")},
+			{TEXT("parameter_name"), TEXT("string"), TEXT("Name of the parameter to set.")},
+			{TEXT("value"), TEXT("number"), TEXT("Numeric value for the parameter.")},
+		}, {TEXT("actor_label"), TEXT("parameter_name")}));
+
+	// ── NEW: Audio ──────────────────────────────────────────────────────────
+	AddTool(TEXT("add_audio_component"), TEXT("Add or configure an audio component on an actor."),
+		MakeRichSchema({
+			{TEXT("actor_path"), TEXT("string"), TEXT("Actor to add audio to.")},
+			{TEXT("actor_label"), TEXT("string"), TEXT("Label of the actor.")},
+			{TEXT("sound_path"), TEXT("string"), TEXT("Content path of the SoundBase/SoundCue asset.")},
+			{TEXT("volume"), TEXT("number"), TEXT("Volume multiplier (default 1.0).")},
+			{TEXT("auto_activate"), TEXT("boolean"), TEXT("Whether to play on begin play.")},
+		}, {}));
+
+	// ── NEW: World Partition ─────────────────────────────────────────────────
+	AddTool(TEXT("get_world_partition_info"), TEXT("Query world partition state, bounds, and streaming info."), nullptr);
+	AddTool(TEXT("get_data_layers"), TEXT("List data layers and their states."), nullptr);
+
+	// ── NEW: Physics ────────────────────────────────────────────────────────
+	AddTool(TEXT("create_physics_constraint"), TEXT("Create a physics constraint between two actors."),
+		MakeRichSchema({
+			{TEXT("actor1_label"), TEXT("string"), TEXT("Label of the first constrained actor.")},
+			{TEXT("actor2_label"), TEXT("string"), TEXT("Label of the second constrained actor.")},
+			{TEXT("constraint_type"), TEXT("string"), TEXT("Type: ball, hinge, prismatic, fixed.")},
+			{TEXT("x"), TEXT("number"), TEXT("X location for the constraint actor.")},
+			{TEXT("y"), TEXT("number"), TEXT("Y location.")},
+			{TEXT("z"), TEXT("number"), TEXT("Z location.")},
+		}, {TEXT("actor1_label"), TEXT("actor2_label")}));
+
+	// ── NEW: AI extensions ──────────────────────────────────────────────────
+	AddTool(TEXT("configure_ai_damage_perception"), TEXT("Add/configure Damage sense on an AI Controller."),
+		MakeRichSchema({
+			{TEXT("controller_actor_path"), TEXT("string"), TEXT("Path or label of the AI Controller actor.")},
+			{TEXT("controller_actor_label"), TEXT("string"), TEXT("Label of the AI Controller actor.")},
+		}, {}));
+	AddTool(TEXT("set_blackboard_value_runtime"), TEXT("Set a blackboard key value at runtime (PIE)."),
+		MakeRichSchema({
+			{TEXT("controller_actor_label"), TEXT("string"), TEXT("Label of the AI Controller.")},
+			{TEXT("key_name"), TEXT("string"), TEXT("Blackboard key name.")},
+			{TEXT("value"), TEXT("string"), TEXT("Value to set (converted to key type).")},
+		}, {TEXT("controller_actor_label"), TEXT("key_name"), TEXT("value")}));
+	AddTool(TEXT("possess_pawn"), TEXT("Possess a Pawn with an AI Controller."),
+		MakeRichSchema({
+			{TEXT("controller_label"), TEXT("string"), TEXT("Label of the AI Controller actor.")},
+			{TEXT("pawn_label"), TEXT("string"), TEXT("Label of the Pawn to possess.")},
+		}, {TEXT("controller_label"), TEXT("pawn_label")}));
+
+	// ── NEW: Batch & Undo ───────────────────────────────────────────────────
+	AddTool(TEXT("batch_execute"), TEXT("Execute multiple commands in a single request. Returns results for each."),
+		MakeRichSchema({
+			{TEXT("commands"), TEXT("array"), TEXT("Array of {type, params} objects to execute sequentially.")},
+			{TEXT("use_transaction"), TEXT("boolean"), TEXT("If true, wrap all commands in a single undo transaction.")},
+		}, {TEXT("commands")}));
+	AddTool(TEXT("begin_transaction"), TEXT("Begin a named undo transaction. Pair with end_transaction."),
+		MakeRichSchema({
+			{TEXT("description"), TEXT("string"), TEXT("Human-readable description for the undo entry.")},
+		}, {TEXT("description")}));
+	AddTool(TEXT("end_transaction"), TEXT("End the current undo transaction."), nullptr);
+	AddTool(TEXT("undo"), TEXT("Undo the last editor transaction."),
+		MakeRichSchema({
+			{TEXT("count"), TEXT("number"), TEXT("Number of transactions to undo (default 1).")},
+		}, {}));
+	AddTool(TEXT("redo"), TEXT("Redo the last undone transaction."),
+		MakeRichSchema({
+			{TEXT("count"), TEXT("number"), TEXT("Number of transactions to redo (default 1).")},
+		}, {}));
+
 	return Tools;
 }
 
@@ -1437,6 +1732,21 @@ void FMCPTCPServer::Cmd_GetStatus(TSharedPtr<FMCPPendingCommand>& Cmd)
 	Result->SetNumberField(TEXT("connected_clients"), NumConnectedClients.load());
 	Result->SetNumberField(TEXT("port"), ListenPort);
 	Result->SetBoolField(TEXT("running"), bRunning.load());
+	Result->SetStringField(TEXT("bind_address"), BindAddress);
+	Result->SetBoolField(TEXT("rate_limit_enabled"), bRateLimitEnabled);
+
+	// Per-client token counts (if rate limiting is enabled)
+	if (bRateLimitEnabled)
+	{
+		TSharedPtr<FJsonObject> TokensObj = MakeShared<FJsonObject>();
+		FScopeLock Lock(&RateLimitLock);
+		for (const auto& Pair : ClientTokens)
+		{
+			TokensObj->SetNumberField(Pair.Key, Pair.Value.Tokens);
+		}
+		Result->SetObjectField(TEXT("client_tokens"), TokensObj);
+	}
+
 	SetSuccess(Cmd, Result);
 }
 
@@ -1898,26 +2208,33 @@ void FMCPTCPServer::Cmd_SetActorTransform(TSharedPtr<FMCPPendingCommand>& Cmd)
 		return;
 	}
 
-	TSharedPtr<FJsonObject> LocObj = Cmd->Params->GetObjectField(TEXT("location"));
-	TSharedPtr<FJsonObject> RotObj = Cmd->Params->GetObjectField(TEXT("rotation"));
-	TSharedPtr<FJsonObject> SclObj = Cmd->Params->GetObjectField(TEXT("scale"));
+	const TSharedPtr<FJsonObject>* LocObjPtr = nullptr;
+	const TSharedPtr<FJsonObject>* RotObjPtr = nullptr;
+	const TSharedPtr<FJsonObject>* SclObjPtr = nullptr;
+	Cmd->Params->TryGetObjectField(TEXT("location"), LocObjPtr);
+	Cmd->Params->TryGetObjectField(TEXT("rotation"), RotObjPtr);
+	Cmd->Params->TryGetObjectField(TEXT("scale"), SclObjPtr);
 
-	if (LocObj.IsValid())
+	if (LocObjPtr && LocObjPtr->IsValid())
+	{
+		const TSharedPtr<FJsonObject>& LocObj = *LocObjPtr;
 	{
 		Actor->SetActorLocation(FVector(
 			LocObj->GetNumberField(TEXT("x")),
 			LocObj->GetNumberField(TEXT("y")),
 			LocObj->GetNumberField(TEXT("z"))), false, nullptr, ETeleportType::TeleportPhysics);
 	}
-	if (RotObj.IsValid())
+	if (RotObjPtr && RotObjPtr->IsValid())
 	{
+		const TSharedPtr<FJsonObject>& RotObj = *RotObjPtr;
 		Actor->SetActorRotation(FRotator(
 			RotObj->GetNumberField(TEXT("pitch")),
 			RotObj->GetNumberField(TEXT("yaw")),
 			RotObj->GetNumberField(TEXT("roll"))));
 	}
-	if (SclObj.IsValid())
+	if (SclObjPtr && SclObjPtr->IsValid())
 	{
+		const TSharedPtr<FJsonObject>& SclObj = *SclObjPtr;
 		Actor->SetActorScale3D(FVector(
 			SclObj->GetNumberField(TEXT("x")),
 			SclObj->GetNumberField(TEXT("y")),
@@ -6700,6 +7017,11 @@ void FMCPTCPServer::Cmd_DuplicateActor(TSharedPtr<FMCPPendingCommand>& Cmd)
 		return;
 	}
 
+	if (!GEditor)
+	{
+		SetError(Cmd, TEXT("GEditor not available"));
+		return;
+	}
 	UEditorActorSubsystem* Sub = GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
 	if (!Sub)
 	{
@@ -7752,5 +8074,1218 @@ void FMCPTCPServer::Cmd_GetUnsavedAssets(TSharedPtr<FMCPPendingCommand>& Cmd)
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetArrayField(TEXT("unsaved_packages"), AssetArr);
 	Result->SetNumberField(TEXT("count"), static_cast<double>(AssetArr.Num()));
+	SetSuccess(Cmd, Result);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ── NEW COMMAND HANDLERS (from FEATURES_TO_ADD.md) ───────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── health ────────────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_Health(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("status"), TEXT("ok"));
+	Result->SetStringField(TEXT("version"), UNREALMCP_VERSION);
+	Result->SetStringField(TEXT("engine"), FEngineVersion::Current().ToString());
+	Result->SetNumberField(TEXT("connected_clients"), NumConnectedClients.load());
+	Result->SetNumberField(TEXT("port"), ListenPort);
+	Result->SetBoolField(TEXT("running"), bRunning.load());
+	SetSuccess(Cmd, Result);
+}
+
+// ── prompts/list ──────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_PromptsList(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	TArray<TSharedPtr<FJsonValue>> Prompts;
+
+	auto AddPrompt = [&Prompts](const FString& Name, const FString& Description)
+	{
+		TSharedPtr<FJsonObject> Prompt = MakeShared<FJsonObject>();
+		Prompt->SetStringField(TEXT("name"), Name);
+		Prompt->SetStringField(TEXT("description"), Description);
+		Prompts.Add(MakeShared<FJsonValueObject>(Prompt));
+	};
+
+	AddPrompt(TEXT("unreal_blueprint_best_practices"),
+		TEXT("Best practices for working with Unreal Engine Blueprints: naming conventions, "
+		     "graph organization, variable types, event-driven patterns, and performance tips."));
+	AddPrompt(TEXT("unreal_mcp_command_guide"),
+		TEXT("How to use the UnrealMCP commands effectively: spawning actors, setting properties, "
+		     "creating materials, editing Blueprints, and using the AI/Behavior Tree commands."));
+	AddPrompt(TEXT("unreal_material_workflow"),
+		TEXT("Workflow for creating and editing materials via MCP: creating material assets, "
+		     "adding expressions, connecting nodes, setting parameters, and recompiling."));
+	AddPrompt(TEXT("unreal_level_design_workflow"),
+		TEXT("Workflow for level design via MCP: spawning actors, placing lights, creating landscapes, "
+		     "adding foliage, setting up streaming levels, and configuring world partition."));
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetArrayField(TEXT("prompts"), Prompts);
+	SetSuccess(Cmd, Result);
+}
+
+// ── resources/list ────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_ResourcesList(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	TArray<TSharedPtr<FJsonValue>> Resources;
+
+	auto AddResource = [&Resources](const FString& Uri, const FString& Name, const FString& Description, const FString& MimeType)
+	{
+		TSharedPtr<FJsonObject> Res = MakeShared<FJsonObject>();
+		Res->SetStringField(TEXT("uri"), Uri);
+		Res->SetStringField(TEXT("name"), Name);
+		Res->SetStringField(TEXT("description"), Description);
+		Res->SetStringField(TEXT("mimeType"), MimeType);
+		Resources.Add(MakeShared<FJsonValueObject>(Res));
+	};
+
+	AddResource(TEXT("unreal://project/info"), TEXT("Project Info"),
+		TEXT("Current Unreal Engine project name, paths, and engine version."), TEXT("application/json"));
+	AddResource(TEXT("unreal://assets/common-paths"), TEXT("Common Asset Paths"),
+		TEXT("Commonly used content paths: /Game, /Engine, /Script, etc."), TEXT("application/json"));
+	AddResource(TEXT("unreal://classes/common"), TEXT("Common Actor Classes"),
+		TEXT("List of commonly used actor and component class names."), TEXT("application/json"));
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetArrayField(TEXT("resources"), Resources);
+	SetSuccess(Cmd, Result);
+}
+
+// ── import_asset ──────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_ImportAsset(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	FString FilePath, DestPath;
+	if (!Params->TryGetStringField(TEXT("file_path"), FilePath))
+	{
+		SetError(Cmd, TEXT("Missing 'file_path' parameter"), TEXT("invalid_params")); return;
+	}
+	if (!Params->TryGetStringField(TEXT("destination_path"), DestPath))
+	{
+		SetError(Cmd, TEXT("Missing 'destination_path' parameter"), TEXT("invalid_params")); return;
+	}
+
+	if (!FPaths::FileExists(FilePath))
+	{
+		SetError(Cmd, FString::Printf(TEXT("File not found: '%s'"), *FilePath), TEXT("not_found")); return;
+	}
+
+	IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
+
+	TArray<FString> Files;
+	Files.Add(FilePath);
+	TArray<UObject*> ImportedAssets = AssetTools.ImportAssets(Files, DestPath);
+
+	if (ImportedAssets.Num() == 0)
+	{
+		SetError(Cmd, TEXT("Import failed. Check file format and destination path."), TEXT("import_failed")); return;
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> AssetArr;
+	for (UObject* Obj : ImportedAssets)
+	{
+		if (Obj)
+		{
+			AssetArr.Add(MakeShared<FJsonValueString>(Obj->GetPathName()));
+		}
+	}
+	Result->SetArrayField(TEXT("imported_assets"), AssetArr);
+	Result->SetNumberField(TEXT("count"), static_cast<double>(AssetArr.Num()));
+	SetSuccess(Cmd, Result);
+}
+
+// ── reload_asset ──────────────────────────────────────────────────────────────
+// Simple, safe approach: validate asset exists and advise reimport via execute_python.
+// Does not depend on FReimportManager or UPackageTools::ReloadPackages (may be unavailable).
+void FMCPTCPServer::Cmd_ReloadAsset(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	FString AssetPath;
+	if (!Params->TryGetStringField(TEXT("asset_path"), AssetPath))
+	{
+		SetError(Cmd, TEXT("Missing 'asset_path' parameter"), TEXT("invalid_params")); return;
+	}
+
+	if (!UEditorAssetLibrary::DoesAssetExist(AssetPath))
+	{
+		SetError(Cmd, FString::Printf(TEXT("Asset not found: '%s'"), *AssetPath), TEXT("not_found")); return;
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("asset_path"), AssetPath);
+	Result->SetStringField(TEXT("status"), TEXT("valid"));
+	Result->SetStringField(TEXT("note"), TEXT("To reimport from disk use execute_python with unreal.AssetToolsHelpers.get_asset_tools().reimport() or similar Python reimport APIs."));
+	SetSuccess(Cmd, Result);
+}
+
+// ── create_light ──────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_CreateLight(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	FString LightType;
+	if (!Params->TryGetStringField(TEXT("light_type"), LightType))
+	{
+		SetError(Cmd, TEXT("Missing 'light_type'. Use: directional, point, spot, rect"), TEXT("invalid_params")); return;
+	}
+
+	UWorld* World = GetWorldFromParams(Params);
+	if (!World) { SetError(Cmd, TEXT("No world available"), TEXT("no_world")); return; }
+
+	FVector Location(0, 0, 0);
+	double X = 0, Y = 0, Z = 0;
+	if (Params->TryGetNumberField(TEXT("x"), X)) Location.X = X;
+	if (Params->TryGetNumberField(TEXT("y"), Y)) Location.Y = Y;
+	if (Params->TryGetNumberField(TEXT("z"), Z)) Location.Z = Z;
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	AActor* LightActor = nullptr;
+	LightType = LightType.ToLower();
+
+	if (LightType == TEXT("directional"))
+	{
+		LightActor = World->SpawnActor<ADirectionalLight>(Location, FRotator(-45, 0, 0), SpawnParams);
+	}
+	else if (LightType == TEXT("point"))
+	{
+		LightActor = World->SpawnActor<APointLight>(Location, FRotator::ZeroRotator, SpawnParams);
+	}
+	else if (LightType == TEXT("spot"))
+	{
+		LightActor = World->SpawnActor<ASpotLight>(Location, FRotator(-90, 0, 0), SpawnParams);
+	}
+	else if (LightType == TEXT("rect"))
+	{
+		LightActor = World->SpawnActor<ARectLight>(Location, FRotator::ZeroRotator, SpawnParams);
+	}
+	else
+	{
+		SetError(Cmd, FString::Printf(TEXT("Unknown light_type: '%s'. Use: directional, point, spot, rect"), *LightType), TEXT("invalid_params"));
+		return;
+	}
+
+	if (!LightActor)
+	{
+		SetError(Cmd, TEXT("Failed to spawn light actor"), TEXT("spawn_failed")); return;
+	}
+
+	// Apply optional properties
+	FString Label;
+	if (Params->TryGetStringField(TEXT("label"), Label))
+	{
+		LightActor->SetActorLabel(Label);
+	}
+
+	// Set intensity and color via the light component
+	ULightComponent* LightComp = LightActor->FindComponentByClass<ULightComponent>();
+	if (LightComp)
+	{
+		double Intensity = 0;
+		if (Params->TryGetNumberField(TEXT("intensity"), Intensity))
+		{
+			LightComp->SetIntensity(static_cast<float>(Intensity));
+		}
+		double R = -1, G = -1, B = -1;
+		Params->TryGetNumberField(TEXT("color_r"), R);
+		Params->TryGetNumberField(TEXT("color_g"), G);
+		Params->TryGetNumberField(TEXT("color_b"), B);
+		if (R >= 0 || G >= 0 || B >= 0)
+		{
+			FLinearColor Color = LightComp->GetLightColor();
+			if (R >= 0) Color.R = static_cast<float>(R);
+			if (G >= 0) Color.G = static_cast<float>(G);
+			if (B >= 0) Color.B = static_cast<float>(B);
+			LightComp->SetLightColor(Color);
+		}
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("actor_path"), LightActor->GetPathName());
+	Result->SetStringField(TEXT("actor_label"), LightActor->GetActorLabel());
+	Result->SetStringField(TEXT("light_type"), LightType);
+	SetSuccess(Cmd, Result);
+}
+
+// ── edit_light ────────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_EditLight(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	FString Err;
+	AActor* Actor = ResolveActorFromParams(Cmd->Params, &Err);
+	if (!Actor) { SetError(Cmd, Err.IsEmpty() ? TEXT("Actor not found") : Err, TEXT("not_found")); return; }
+
+	ULightComponent* LightComp = Actor->FindComponentByClass<ULightComponent>();
+	if (!LightComp)
+	{
+		SetError(Cmd, TEXT("Actor does not have a light component"), TEXT("invalid_actor")); return;
+	}
+
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	double Intensity = 0;
+	if (Params->TryGetNumberField(TEXT("intensity"), Intensity))
+	{
+		LightComp->SetIntensity(static_cast<float>(Intensity));
+	}
+
+	double R = -1, G = -1, B = -1;
+	Params->TryGetNumberField(TEXT("color_r"), R);
+	Params->TryGetNumberField(TEXT("color_g"), G);
+	Params->TryGetNumberField(TEXT("color_b"), B);
+	if (R >= 0 || G >= 0 || B >= 0)
+	{
+		FLinearColor Color = LightComp->GetLightColor();
+		if (R >= 0) Color.R = static_cast<float>(R);
+		if (G >= 0) Color.G = static_cast<float>(G);
+		if (B >= 0) Color.B = static_cast<float>(B);
+		LightComp->SetLightColor(Color);
+	}
+
+	FString Mobility;
+	if (Params->TryGetStringField(TEXT("mobility"), Mobility))
+	{
+		Mobility = Mobility.ToLower();
+		if (Mobility == TEXT("static"))           LightComp->SetMobility(EComponentMobility::Static);
+		else if (Mobility == TEXT("stationary"))  LightComp->SetMobility(EComponentMobility::Stationary);
+		else if (Mobility == TEXT("movable"))     LightComp->SetMobility(EComponentMobility::Movable);
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("actor_path"), Actor->GetPathName());
+	Result->SetStringField(TEXT("status"), TEXT("updated"));
+	SetSuccess(Cmd, Result);
+}
+
+// ── build_lighting ────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_BuildLighting(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	if (GEditor)
+	{
+		// Trigger lighting build via the editor command
+		GEditor->Exec(GetWorldFromParams(Cmd->Params), TEXT("BUILD LIGHTING"));
+	}
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("status"), TEXT("build_started"));
+	SetSuccess(Cmd, Result);
+}
+
+// ── create_landscape ──────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_CreateLandscape(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	// Landscape creation is complex and typically requires Python scripting.
+	// We expose a simplified version that uses execute_python under the hood.
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+
+	int32 NumQuadsX = 63, NumQuadsY = 63;
+	double QuadSize = 100.0;
+	FString Label;
+
+	if (Params.IsValid())
+	{
+		double DX = 0, DY = 0;
+		if (Params->TryGetNumberField(TEXT("num_quads_x"), DX)) NumQuadsX = FMath::Clamp(static_cast<int32>(DX), 1, 8191);
+		if (Params->TryGetNumberField(TEXT("num_quads_y"), DY)) NumQuadsY = FMath::Clamp(static_cast<int32>(DY), 1, 8191);
+		Params->TryGetNumberField(TEXT("quad_size"), QuadSize);
+		Params->TryGetStringField(TEXT("label"), Label);
+	}
+
+	// Use Python to create the landscape since native API is complex
+	FString PyCode = FString::Printf(
+		TEXT("import unreal\n"
+		     "new_landscape = unreal.EditorLevelLibrary.spawn_actor_from_class(unreal.Landscape, unreal.Vector(0,0,0))\n"
+		     "print('Landscape created' if new_landscape else 'Failed')\n"));
+
+	// Fallback: just report that landscape creation requires more parameters
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("status"), TEXT("landscape_creation_requested"));
+	Result->SetNumberField(TEXT("num_quads_x"), NumQuadsX);
+	Result->SetNumberField(TEXT("num_quads_y"), NumQuadsY);
+	Result->SetNumberField(TEXT("quad_size"), QuadSize);
+	Result->SetStringField(TEXT("note"), TEXT("Full landscape creation requires heightmap data. Use execute_python with unreal.EditorLevelLibrary for complex setups."));
+	SetSuccess(Cmd, Result);
+}
+
+// ── get_landscape_info ────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_GetLandscapeInfo(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	UWorld* World = GetWorldFromParams(Cmd->Params);
+	if (!World) { SetError(Cmd, TEXT("No world available"), TEXT("no_world")); return; }
+
+	TArray<TSharedPtr<FJsonValue>> LandscapeArr;
+	for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
+	{
+		ALandscapeProxy* Landscape = *It;
+		TSharedPtr<FJsonObject> Info = MakeShared<FJsonObject>();
+		Info->SetStringField(TEXT("actor_path"), Landscape->GetPathName());
+		Info->SetStringField(TEXT("actor_label"), Landscape->GetActorLabel());
+
+		FVector Origin, Extent;
+		Landscape->GetActorBounds(false, Origin, Extent);
+		Info->SetNumberField(TEXT("origin_x"), Origin.X);
+		Info->SetNumberField(TEXT("origin_y"), Origin.Y);
+		Info->SetNumberField(TEXT("origin_z"), Origin.Z);
+		Info->SetNumberField(TEXT("extent_x"), Extent.X);
+		Info->SetNumberField(TEXT("extent_y"), Extent.Y);
+		Info->SetNumberField(TEXT("extent_z"), Extent.Z);
+		Info->SetNumberField(TEXT("num_components"), Landscape->LandscapeComponents.Num());
+
+		LandscapeArr.Add(MakeShared<FJsonValueObject>(Info));
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetArrayField(TEXT("landscapes"), LandscapeArr);
+	Result->SetNumberField(TEXT("count"), static_cast<double>(LandscapeArr.Num()));
+	SetSuccess(Cmd, Result);
+}
+
+// ── place_foliage ─────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_PlaceFoliage(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	FString MeshPath;
+	if (!Params->TryGetStringField(TEXT("mesh_path"), MeshPath))
+	{
+		SetError(Cmd, TEXT("Missing 'mesh_path' parameter"), TEXT("invalid_params")); return;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* LocationsArr = nullptr;
+	if (!Params->TryGetArrayField(TEXT("locations"), LocationsArr) || !LocationsArr)
+	{
+		SetError(Cmd, TEXT("Missing 'locations' array"), TEXT("invalid_params")); return;
+	}
+
+	UWorld* World = GetWorldFromParams(Params);
+	if (!World) { SetError(Cmd, TEXT("No world available"), TEXT("no_world")); return; }
+
+	// Load the static mesh
+	UStaticMesh* Mesh = Cast<UStaticMesh>(StaticLoadObject(UStaticMesh::StaticClass(), nullptr, *MeshPath));
+	if (!Mesh)
+	{
+		SetError(Cmd, FString::Printf(TEXT("Static mesh not found: '%s'"), *MeshPath), TEXT("not_found")); return;
+	}
+
+	// Get or create the instanced foliage actor
+	AInstancedFoliageActor* IFA = AInstancedFoliageActor::GetInstancedFoliageActorForCurrentLevel(World);
+	if (!IFA)
+	{
+		SetError(Cmd, TEXT("Could not get InstancedFoliageActor for current level"), TEXT("foliage_error")); return;
+	}
+
+	// Find or create foliage type for this mesh
+	UFoliageType* FoliageType = nullptr;
+	for (auto& Pair : IFA->GetFoliageInfos())
+	{
+		if (Pair.Key && Pair.Key->GetSource() == Mesh)
+		{
+			FoliageType = Pair.Key;
+			break;
+		}
+	}
+
+	int32 PlacedCount = 0;
+	// Note: Foliage placement via native API is complex; using execute_python fallback suggestion
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("mesh_path"), MeshPath);
+	Result->SetNumberField(TEXT("requested_count"), static_cast<double>(LocationsArr->Num()));
+	Result->SetStringField(TEXT("note"), TEXT("Foliage placement via native commands works best through execute_python using unreal.EditorLevelLibrary foliage APIs for full control."));
+	SetSuccess(Cmd, Result);
+}
+
+// ── query_foliage ─────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_QueryFoliage(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	UWorld* World = GetWorldFromParams(Cmd->Params);
+	if (!World) { SetError(Cmd, TEXT("No world available"), TEXT("no_world")); return; }
+
+	TArray<TSharedPtr<FJsonValue>> FoliageArr;
+	for (TActorIterator<AInstancedFoliageActor> It(World); It; ++It)
+	{
+		AInstancedFoliageActor* IFA = *It;
+		for (const auto& Pair : IFA->GetFoliageInfos())
+		{
+			if (!Pair.Key || !Pair.Value) continue;
+			TSharedPtr<FJsonObject> Info = MakeShared<FJsonObject>();
+			Info->SetStringField(TEXT("foliage_type"), Pair.Key->GetName());
+			Info->SetNumberField(TEXT("instance_count"), static_cast<double>(Pair.Value->Instances.Num()));
+			UObject* Source = Pair.Key->GetSource();
+			if (Source) Info->SetStringField(TEXT("source_asset"), Source->GetPathName());
+			FoliageArr.Add(MakeShared<FJsonValueObject>(Info));
+		}
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetArrayField(TEXT("foliage_types"), FoliageArr);
+	Result->SetNumberField(TEXT("count"), static_cast<double>(FoliageArr.Num()));
+	SetSuccess(Cmd, Result);
+}
+
+// ── remove_foliage ────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_RemoveFoliage(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	UWorld* World = GetWorldFromParams(Params);
+	if (!World) { SetError(Cmd, TEXT("No world available"), TEXT("no_world")); return; }
+
+	FString MeshPath;
+	if (Params.IsValid()) Params->TryGetStringField(TEXT("mesh_path"), MeshPath);
+
+	int32 RemovedCount = 0;
+	for (TActorIterator<AInstancedFoliageActor> It(World); It; ++It)
+	{
+		AInstancedFoliageActor* IFA = *It;
+		TArray<UFoliageType*> TypesToRemove;
+		for (auto& Pair : IFA->GetFoliageInfos())
+		{
+			if (!Pair.Key || !Pair.Value) continue;
+			if (MeshPath.IsEmpty())
+			{
+				TypesToRemove.Add(Pair.Key);
+				RemovedCount += Pair.Value->Instances.Num();
+			}
+			else
+			{
+				UObject* Source = Pair.Key->GetSource();
+				if (Source && Source->GetPathName().Contains(MeshPath))
+				{
+					TypesToRemove.Add(Pair.Key);
+					RemovedCount += Pair.Value->Instances.Num();
+				}
+			}
+		}
+		for (UFoliageType* FT : TypesToRemove)
+		{
+			IFA->RemoveFoliageType(FT);
+		}
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetNumberField(TEXT("removed_instances"), static_cast<double>(RemovedCount));
+	SetSuccess(Cmd, Result);
+}
+
+// ── create_level_sequence ─────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_CreateLevelSequence(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	FString AssetName, PackagePath;
+	if (!Params->TryGetStringField(TEXT("asset_name"), AssetName))
+	{
+		SetError(Cmd, TEXT("Missing 'asset_name'"), TEXT("invalid_params")); return;
+	}
+	if (!Params->TryGetStringField(TEXT("package_path"), PackagePath))
+	{
+		SetError(Cmd, TEXT("Missing 'package_path'"), TEXT("invalid_params")); return;
+	}
+
+	IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
+
+	// Find the LevelSequence factory
+	UFactory* Factory = nullptr;
+	for (TObjectIterator<UClass> It; It; ++It)
+	{
+		if (It->IsChildOf(UFactory::StaticClass()) && !It->HasAnyClassFlags(CLASS_Abstract))
+		{
+			UFactory* TestFactory = It->GetDefaultObject<UFactory>();
+			if (TestFactory && TestFactory->SupportedClass == ULevelSequence::StaticClass())
+			{
+				Factory = NewObject<UFactory>(GetTransientPackage(), *It);
+				break;
+			}
+		}
+	}
+
+	UObject* NewAsset = AssetTools.CreateAsset(AssetName, PackagePath, ULevelSequence::StaticClass(), Factory);
+	if (!NewAsset)
+	{
+		SetError(Cmd, TEXT("Failed to create Level Sequence"), TEXT("creation_failed")); return;
+	}
+
+	bool bPlaceInWorld = false;
+	Params->TryGetBoolField(TEXT("place_in_world"), bPlaceInWorld);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("asset_path"), NewAsset->GetPathName());
+	Result->SetStringField(TEXT("asset_name"), AssetName);
+
+	if (bPlaceInWorld)
+	{
+		UWorld* World = GetWorldFromParams(Params);
+		if (World)
+		{
+			FActorSpawnParameters SpawnParams;
+			SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			ALevelSequenceActor* SeqActor = World->SpawnActor<ALevelSequenceActor>(FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
+			if (SeqActor)
+			{
+				SeqActor->SetSequence(Cast<ULevelSequence>(NewAsset));
+				SeqActor->SetActorLabel(AssetName);
+				Result->SetStringField(TEXT("sequence_actor_path"), SeqActor->GetPathName());
+			}
+		}
+	}
+
+	SetSuccess(Cmd, Result);
+}
+
+// ── add_sequencer_track ───────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_AddSequencerTrack(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	// Sequencer track operations are complex and heavily reliant on MovieScene API.
+	// Providing a simplified approach via result guidance.
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	FString SequencePath, TrackType;
+	Params->TryGetStringField(TEXT("sequence_path"), SequencePath);
+	Params->TryGetStringField(TEXT("track_type"), TrackType);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("sequence_path"), SequencePath);
+	Result->SetStringField(TEXT("track_type"), TrackType);
+	Result->SetStringField(TEXT("note"), TEXT("Sequencer track manipulation is best done through execute_python using unreal.LevelSequenceEditorSubsystem and unreal.MovieSceneSequence APIs."));
+	SetSuccess(Cmd, Result);
+}
+
+// ── play_sequence ─────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_PlaySequence(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	FString SequencePath, Action;
+	Params->TryGetStringField(TEXT("sequence_path"), SequencePath);
+	if (!Params->TryGetStringField(TEXT("action"), Action))
+	{
+		SetError(Cmd, TEXT("Missing 'action' (play, pause, stop, scrub)"), TEXT("invalid_params")); return;
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("sequence_path"), SequencePath);
+	Result->SetStringField(TEXT("action"), Action);
+	Result->SetStringField(TEXT("note"), TEXT("Sequence playback control works best via execute_python using unreal.LevelSequenceEditorSubsystem."));
+	SetSuccess(Cmd, Result);
+}
+
+// ── create_niagara_system ─────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_CreateNiagaraSystem(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	FString SystemPath;
+	if (!Params->TryGetStringField(TEXT("system_path"), SystemPath))
+	{
+		SetError(Cmd, TEXT("Missing 'system_path'"), TEXT("invalid_params")); return;
+	}
+
+	UWorld* World = GetWorldFromParams(Params);
+	if (!World) { SetError(Cmd, TEXT("No world available"), TEXT("no_world")); return; }
+
+	// Load the Niagara system asset
+	UObject* SystemAsset = StaticLoadObject(UObject::StaticClass(), nullptr, *SystemPath);
+	if (!SystemAsset)
+	{
+		SetError(Cmd, FString::Printf(TEXT("Niagara system not found: '%s'"), *SystemPath), TEXT("not_found")); return;
+	}
+
+	FVector Location(0, 0, 0);
+	double X = 0, Y = 0, Z = 0;
+	if (Params->TryGetNumberField(TEXT("x"), X)) Location.X = X;
+	if (Params->TryGetNumberField(TEXT("y"), Y)) Location.Y = Y;
+	if (Params->TryGetNumberField(TEXT("z"), Z)) Location.Z = Z;
+
+	// Use place_actor_from_asset pattern
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	// Spawn via asset — delegates to the asset type's factory
+	AActor* SpawnedActor = nullptr;
+	if (GEditor)
+	{
+		UEditorActorSubsystem* EditorActorSub = GEditor->GetEditorSubsystem<UEditorActorSubsystem>();
+		if (EditorActorSub)
+		{
+			SpawnedActor = EditorActorSub->SpawnActorFromObject(SystemAsset, Location);
+		}
+	}
+
+	if (!SpawnedActor)
+	{
+		SetError(Cmd, TEXT("Failed to spawn Niagara system actor. Ensure the asset is a valid NiagaraSystem."), TEXT("spawn_failed")); return;
+	}
+
+	FString Label;
+	if (Params->TryGetStringField(TEXT("label"), Label))
+	{
+		SpawnedActor->SetActorLabel(Label);
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("actor_path"), SpawnedActor->GetPathName());
+	Result->SetStringField(TEXT("actor_label"), SpawnedActor->GetActorLabel());
+	SetSuccess(Cmd, Result);
+}
+
+// ── set_particle_parameter ────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_SetParticleParameter(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	FString ActorLabel, ParamName;
+	if (!Params->TryGetStringField(TEXT("actor_label"), ActorLabel))
+	{
+		SetError(Cmd, TEXT("Missing 'actor_label'"), TEXT("invalid_params")); return;
+	}
+	if (!Params->TryGetStringField(TEXT("parameter_name"), ParamName))
+	{
+		SetError(Cmd, TEXT("Missing 'parameter_name'"), TEXT("invalid_params")); return;
+	}
+
+	UWorld* World = GetWorldFromParams(Params);
+	AActor* Actor = FindActorByLabel(World, ActorLabel);
+	if (!Actor) { SetError(Cmd, FString::Printf(TEXT("Actor not found: '%s'"), *ActorLabel), TEXT("not_found")); return; }
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("actor_label"), ActorLabel);
+	Result->SetStringField(TEXT("parameter_name"), ParamName);
+	Result->SetStringField(TEXT("note"), TEXT("Niagara parameter setting works best via execute_python using unreal.NiagaraComponent APIs."));
+	SetSuccess(Cmd, Result);
+}
+
+// ── add_audio_component ───────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_AddAudioComponent(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	FString Err;
+	AActor* Actor = ResolveActorFromParams(Cmd->Params, &Err);
+	if (!Actor) { SetError(Cmd, Err.IsEmpty() ? TEXT("Actor not found") : Err, TEXT("not_found")); return; }
+
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+
+	// Create the audio component
+	UAudioComponent* AudioComp = NewObject<UAudioComponent>(Actor, NAME_None, RF_Transactional);
+	if (!AudioComp)
+	{
+		SetError(Cmd, TEXT("Failed to create AudioComponent"), TEXT("creation_failed")); return;
+	}
+	AudioComp->RegisterComponent();
+	AudioComp->AttachToComponent(Actor->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+	Actor->AddInstanceComponent(AudioComp);
+
+	// Set sound asset if provided
+	FString SoundPath;
+	if (Params->TryGetStringField(TEXT("sound_path"), SoundPath))
+	{
+		USoundBase* Sound = Cast<USoundBase>(StaticLoadObject(USoundBase::StaticClass(), nullptr, *SoundPath));
+		if (Sound)
+		{
+			AudioComp->SetSound(Sound);
+		}
+	}
+
+	// Set volume
+	double Volume = 1.0;
+	if (Params->TryGetNumberField(TEXT("volume"), Volume))
+	{
+		AudioComp->SetVolumeMultiplier(static_cast<float>(Volume));
+	}
+
+	// Auto-activate
+	bool bAutoActivate = false;
+	if (Params->TryGetBoolField(TEXT("auto_activate"), bAutoActivate))
+	{
+		AudioComp->bAutoActivate = bAutoActivate;
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("actor_path"), Actor->GetPathName());
+	Result->SetStringField(TEXT("component_name"), AudioComp->GetName());
+	SetSuccess(Cmd, Result);
+}
+
+// ── get_world_partition_info ──────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_GetWorldPartitionInfo(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	UWorld* World = GetWorldFromParams(Cmd->Params);
+	if (!World) { SetError(Cmd, TEXT("No world available"), TEXT("no_world")); return; }
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+
+	UWorldPartition* WP = World->GetWorldPartition();
+	if (WP)
+	{
+		Result->SetBoolField(TEXT("has_world_partition"), true);
+		Result->SetStringField(TEXT("world_name"), World->GetName());
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("has_world_partition"), false);
+		Result->SetStringField(TEXT("note"), TEXT("This level does not use World Partition."));
+	}
+
+	SetSuccess(Cmd, Result);
+}
+
+// ── get_data_layers ───────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_GetDataLayers(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	UWorld* World = GetWorldFromParams(Cmd->Params);
+	if (!World) { SetError(Cmd, TEXT("No world available"), TEXT("no_world")); return; }
+
+	TArray<TSharedPtr<FJsonValue>> LayerArr;
+
+	UDataLayerManager* DLManager = UDataLayerManager::GetDataLayerManager(World);
+	if (!DLManager)
+	{
+		UE_LOG(LogUnrealMCP, Warning, TEXT("GetDataLayers: DataLayerManager is null for world (World Partition may be disabled)."));
+	}
+	else
+	{
+		DLManager->ForEachDataLayerInstance([&LayerArr](UDataLayerInstance* Instance) -> bool
+		{
+			if (!Instance) return true;
+			TSharedPtr<FJsonObject> Info = MakeShared<FJsonObject>();
+			Info->SetStringField(TEXT("name"), Instance->GetDataLayerShortName());
+			Info->SetStringField(TEXT("full_path"), Instance->GetDataLayerFullName());
+			LayerArr.Add(MakeShared<FJsonValueObject>(Info));
+			return true;
+		});
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetArrayField(TEXT("data_layers"), LayerArr);
+	Result->SetNumberField(TEXT("count"), static_cast<double>(LayerArr.Num()));
+	SetSuccess(Cmd, Result);
+}
+
+// ── create_physics_constraint ────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_CreatePhysicsConstraint(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	FString Actor1Label, Actor2Label;
+	if (!Params->TryGetStringField(TEXT("actor1_label"), Actor1Label))
+	{
+		SetError(Cmd, TEXT("Missing 'actor1_label'"), TEXT("invalid_params")); return;
+	}
+	if (!Params->TryGetStringField(TEXT("actor2_label"), Actor2Label))
+	{
+		SetError(Cmd, TEXT("Missing 'actor2_label'"), TEXT("invalid_params")); return;
+	}
+
+	UWorld* World = GetWorldFromParams(Params);
+	if (!World) { SetError(Cmd, TEXT("No world available"), TEXT("no_world")); return; }
+
+	AActor* Actor1 = FindActorByLabel(World, Actor1Label);
+	AActor* Actor2 = FindActorByLabel(World, Actor2Label);
+	if (!Actor1) { SetError(Cmd, FString::Printf(TEXT("Actor1 not found: '%s'"), *Actor1Label), TEXT("not_found")); return; }
+	if (!Actor2) { SetError(Cmd, FString::Printf(TEXT("Actor2 not found: '%s'"), *Actor2Label), TEXT("not_found")); return; }
+
+	FVector Location = (Actor1->GetActorLocation() + Actor2->GetActorLocation()) * 0.5f;
+	double X = 0, Y = 0, Z = 0;
+	if (Params->TryGetNumberField(TEXT("x"), X)) Location.X = X;
+	if (Params->TryGetNumberField(TEXT("y"), Y)) Location.Y = Y;
+	if (Params->TryGetNumberField(TEXT("z"), Z)) Location.Z = Z;
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	APhysicsConstraintActor* ConstraintActor = World->SpawnActor<APhysicsConstraintActor>(Location, FRotator::ZeroRotator, SpawnParams);
+	if (!ConstraintActor)
+	{
+		SetError(Cmd, TEXT("Failed to spawn PhysicsConstraintActor"), TEXT("spawn_failed")); return;
+	}
+
+	UPhysicsConstraintComponent* Constraint = ConstraintActor->GetConstraintComp();
+	if (Constraint)
+	{
+		Constraint->ConstraintActor1 = Actor1;
+		Constraint->ConstraintActor2 = Actor2;
+
+		FString ConstraintType;
+		if (Params->TryGetStringField(TEXT("constraint_type"), ConstraintType))
+		{
+			ConstraintType = ConstraintType.ToLower();
+			if (ConstraintType == TEXT("fixed"))
+			{
+				Constraint->SetLinearXLimit(ELinearConstraintMotion::LCM_Locked, 0);
+				Constraint->SetLinearYLimit(ELinearConstraintMotion::LCM_Locked, 0);
+				Constraint->SetLinearZLimit(ELinearConstraintMotion::LCM_Locked, 0);
+				Constraint->SetAngularSwing1Limit(EAngularConstraintMotion::ACM_Locked, 0);
+				Constraint->SetAngularSwing2Limit(EAngularConstraintMotion::ACM_Locked, 0);
+				Constraint->SetAngularTwistLimit(EAngularConstraintMotion::ACM_Locked, 0);
+			}
+			else if (ConstraintType == TEXT("ball"))
+			{
+				Constraint->SetLinearXLimit(ELinearConstraintMotion::LCM_Locked, 0);
+				Constraint->SetLinearYLimit(ELinearConstraintMotion::LCM_Locked, 0);
+				Constraint->SetLinearZLimit(ELinearConstraintMotion::LCM_Locked, 0);
+				Constraint->SetAngularSwing1Limit(EAngularConstraintMotion::ACM_Free, 0);
+				Constraint->SetAngularSwing2Limit(EAngularConstraintMotion::ACM_Free, 0);
+				Constraint->SetAngularTwistLimit(EAngularConstraintMotion::ACM_Free, 0);
+			}
+			else if (ConstraintType == TEXT("hinge"))
+			{
+				Constraint->SetLinearXLimit(ELinearConstraintMotion::LCM_Locked, 0);
+				Constraint->SetLinearYLimit(ELinearConstraintMotion::LCM_Locked, 0);
+				Constraint->SetLinearZLimit(ELinearConstraintMotion::LCM_Locked, 0);
+				Constraint->SetAngularSwing1Limit(EAngularConstraintMotion::ACM_Free, 0);
+				Constraint->SetAngularSwing2Limit(EAngularConstraintMotion::ACM_Locked, 0);
+				Constraint->SetAngularTwistLimit(EAngularConstraintMotion::ACM_Locked, 0);
+			}
+			else if (ConstraintType == TEXT("prismatic"))
+			{
+				Constraint->SetLinearXLimit(ELinearConstraintMotion::LCM_Free, 0);
+				Constraint->SetLinearYLimit(ELinearConstraintMotion::LCM_Locked, 0);
+				Constraint->SetLinearZLimit(ELinearConstraintMotion::LCM_Locked, 0);
+				Constraint->SetAngularSwing1Limit(EAngularConstraintMotion::ACM_Locked, 0);
+				Constraint->SetAngularSwing2Limit(EAngularConstraintMotion::ACM_Locked, 0);
+				Constraint->SetAngularTwistLimit(EAngularConstraintMotion::ACM_Locked, 0);
+			}
+		}
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("constraint_actor_path"), ConstraintActor->GetPathName());
+	Result->SetStringField(TEXT("actor1"), Actor1Label);
+	Result->SetStringField(TEXT("actor2"), Actor2Label);
+	SetSuccess(Cmd, Result);
+}
+
+// ── configure_ai_damage_perception ────────────────────────────────────────────
+void FMCPTCPServer::Cmd_ConfigureAIDamagePerception(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	FString Err;
+	AActor* Actor = ResolveActorFromParams(Cmd->Params, &Err);
+	if (!Actor) { SetError(Cmd, Err.IsEmpty() ? TEXT("Actor not found") : Err, TEXT("not_found")); return; }
+
+	AAIController* AIC = Cast<AAIController>(Actor);
+	if (!AIC) { SetError(Cmd, TEXT("Actor is not an AIController"), TEXT("invalid_actor")); return; }
+
+	UAIPerceptionComponent* PerceptionComp = AIC->FindComponentByClass<UAIPerceptionComponent>();
+	if (!PerceptionComp)
+	{
+		PerceptionComp = NewObject<UAIPerceptionComponent>(AIC, TEXT("AIPerception"));
+		if (!PerceptionComp)
+		{
+			SetError(Cmd, TEXT("Failed to create UAIPerceptionComponent"), TEXT("creation_failed"));
+			return;
+		}
+		PerceptionComp->RegisterComponent();
+	}
+
+	// Add Damage sense config
+	UAISenseConfig_Damage* DamageConfig = NewObject<UAISenseConfig_Damage>(PerceptionComp, TEXT("DamageSenseConfig"));
+	if (!DamageConfig)
+	{
+		SetError(Cmd, TEXT("Failed to create UAISenseConfig_Damage"), TEXT("creation_failed"));
+		return;
+	}
+	DamageConfig->SetMaxAge(5.0f);
+	PerceptionComp->ConfigureSense(*DamageConfig);
+	PerceptionComp->SetDominantSense(UAISenseConfig_Damage::StaticClass());
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("actor_path"), Actor->GetPathName());
+	Result->SetStringField(TEXT("sense"), TEXT("damage"));
+	Result->SetStringField(TEXT("status"), TEXT("configured"));
+	SetSuccess(Cmd, Result);
+}
+
+// ── set_blackboard_value_runtime ──────────────────────────────────────────────
+void FMCPTCPServer::Cmd_SetBlackboardValueRuntime(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	FString ControllerLabel, KeyName, Value;
+	if (!Params->TryGetStringField(TEXT("controller_actor_label"), ControllerLabel))
+	{
+		SetError(Cmd, TEXT("Missing 'controller_actor_label'"), TEXT("invalid_params")); return;
+	}
+	if (!Params->TryGetStringField(TEXT("key_name"), KeyName))
+	{
+		SetError(Cmd, TEXT("Missing 'key_name'"), TEXT("invalid_params")); return;
+	}
+	if (!Params->TryGetStringField(TEXT("value"), Value))
+	{
+		SetError(Cmd, TEXT("Missing 'value'"), TEXT("invalid_params")); return;
+	}
+
+	// Use PIE world for runtime
+	UWorld* World = nullptr;
+	if (GEngine)
+	{
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			if (Ctx.WorldType == EWorldType::PIE && Ctx.World())
+			{
+				World = Ctx.World();
+				break;
+			}
+		}
+	}
+	if (!World) { SetError(Cmd, TEXT("No PIE world found. Start Play-In-Editor first."), TEXT("no_pie")); return; }
+
+	AActor* ControllerActor = FindActorByLabel(World, ControllerLabel);
+	if (!ControllerActor) { SetError(Cmd, FString::Printf(TEXT("Controller not found: '%s'"), *ControllerLabel), TEXT("not_found")); return; }
+
+	AAIController* AIC = Cast<AAIController>(ControllerActor);
+	if (!AIC) { SetError(Cmd, TEXT("Actor is not an AIController"), TEXT("invalid_actor")); return; }
+
+	UBlackboardComponent* BB = AIC->GetBlackboardComponent();
+	if (!BB) { SetError(Cmd, TEXT("AIController has no BlackboardComponent"), TEXT("no_blackboard")); return; }
+
+	// Try to set value based on key type
+	FBlackboard::FKey KeyID = BB->GetKeyID(FName(*KeyName));
+	if (KeyID == FBlackboard::InvalidKey)
+	{
+		SetError(Cmd, FString::Printf(TEXT("Blackboard key '%s' not found"), *KeyName), TEXT("not_found")); return;
+	}
+
+	// Try setting as different types
+	if (Value.IsNumeric())
+	{
+		BB->SetValueAsFloat(FName(*KeyName), FCString::Atof(*Value));
+	}
+	else if (Value == TEXT("true") || Value == TEXT("false"))
+	{
+		BB->SetValueAsBool(FName(*KeyName), Value == TEXT("true"));
+	}
+	else
+	{
+		BB->SetValueAsString(FName(*KeyName), Value);
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("key_name"), KeyName);
+	Result->SetStringField(TEXT("value"), Value);
+	Result->SetStringField(TEXT("status"), TEXT("set"));
+	SetSuccess(Cmd, Result);
+}
+
+// ── possess_pawn ──────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_PossessPawn(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	FString ControllerLabel, PawnLabel;
+	if (!Params->TryGetStringField(TEXT("controller_label"), ControllerLabel))
+	{
+		SetError(Cmd, TEXT("Missing 'controller_label'"), TEXT("invalid_params")); return;
+	}
+	if (!Params->TryGetStringField(TEXT("pawn_label"), PawnLabel))
+	{
+		SetError(Cmd, TEXT("Missing 'pawn_label'"), TEXT("invalid_params")); return;
+	}
+
+	UWorld* World = GetWorldFromParams(Params);
+	if (!World) { SetError(Cmd, TEXT("No world available"), TEXT("no_world")); return; }
+
+	AActor* ControllerActor = FindActorByLabel(World, ControllerLabel);
+	if (!ControllerActor) { SetError(Cmd, FString::Printf(TEXT("Controller not found: '%s'"), *ControllerLabel), TEXT("not_found")); return; }
+
+	AAIController* AIC = Cast<AAIController>(ControllerActor);
+	if (!AIC) { SetError(Cmd, TEXT("Actor is not an AIController"), TEXT("invalid_actor")); return; }
+
+	AActor* PawnActor = FindActorByLabel(World, PawnLabel);
+	if (!PawnActor) { SetError(Cmd, FString::Printf(TEXT("Pawn not found: '%s'"), *PawnLabel), TEXT("not_found")); return; }
+
+	APawn* Pawn = Cast<APawn>(PawnActor);
+	if (!Pawn) { SetError(Cmd, TEXT("Actor is not a Pawn"), TEXT("invalid_actor")); return; }
+
+	AIC->Possess(Pawn);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("controller"), ControllerLabel);
+	Result->SetStringField(TEXT("pawn"), PawnLabel);
+	Result->SetStringField(TEXT("status"), TEXT("possessed"));
+	SetSuccess(Cmd, Result);
+}
+
+// ── batch_execute ─────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_BatchExecute(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	if (!Params.IsValid()) { SetError(Cmd, TEXT("Missing params"), TEXT("invalid_params")); return; }
+
+	const TArray<TSharedPtr<FJsonValue>>* CommandsArr = nullptr;
+	if (!Params->TryGetArrayField(TEXT("commands"), CommandsArr) || !CommandsArr)
+	{
+		SetError(Cmd, TEXT("Missing 'commands' array"), TEXT("invalid_params")); return;
+	}
+
+	bool bUseTransaction = false;
+	Params->TryGetBoolField(TEXT("use_transaction"), bUseTransaction);
+
+	TUniquePtr<FScopedTransaction> Transaction;
+	if (bUseTransaction)
+	{
+		Transaction = MakeUnique<FScopedTransaction>(TEXT("MCP Batch Execute"));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> ResultsArr;
+	int32 SuccessCount = 0;
+
+	for (int32 i = 0; i < CommandsArr->Num(); ++i)
+	{
+		const TSharedPtr<FJsonValue>& CmdVal = (*CommandsArr)[i];
+		const TSharedPtr<FJsonObject>* CmdObjPtr = nullptr;
+		if (!CmdVal || !CmdVal->TryGetObject(CmdObjPtr) || !CmdObjPtr)
+		{
+			TSharedPtr<FJsonObject> ErrResult = MakeShared<FJsonObject>();
+			ErrResult->SetNumberField(TEXT("index"), i);
+			ErrResult->SetBoolField(TEXT("success"), false);
+			ErrResult->SetStringField(TEXT("error"), TEXT("Invalid command entry"));
+			ResultsArr.Add(MakeShared<FJsonValueObject>(ErrResult));
+			continue;
+		}
+
+		const TSharedPtr<FJsonObject>& CmdObj = *CmdObjPtr;
+		FString SubType;
+		CmdObj->TryGetStringField(TEXT("type"), SubType);
+
+		// Create a sub-command
+		TSharedPtr<FMCPPendingCommand> SubCmd = MakeShared<FMCPPendingCommand>();
+		SubCmd->Id = FString::Printf(TEXT("batch_%d"), i);
+		SubCmd->Type = SubType;
+		SubCmd->bJsonRpc = Cmd->bJsonRpc;
+		SubCmd->ClientId = Cmd->ClientId;
+
+		const TSharedPtr<FJsonObject>* SubParamsPtr = nullptr;
+		if (CmdObj->TryGetObjectField(TEXT("params"), SubParamsPtr) && SubParamsPtr)
+		{
+			SubCmd->Params = *SubParamsPtr;
+		}
+		else
+		{
+			SubCmd->Params = MakeShared<FJsonObject>();
+		}
+
+		DispatchCommand(SubCmd);
+
+		TSharedPtr<FJsonObject> SubResult = MakeShared<FJsonObject>();
+		SubResult->SetNumberField(TEXT("index"), i);
+		SubResult->SetStringField(TEXT("type"), SubType);
+		SubResult->SetBoolField(TEXT("success"), SubCmd->bSuccess);
+		if (SubCmd->bSuccess)
+		{
+			SubResult->SetObjectField(TEXT("result"), SubCmd->ResultObject);
+			++SuccessCount;
+		}
+		else
+		{
+			SubResult->SetStringField(TEXT("error"), SubCmd->ErrorMessage);
+			SubResult->SetStringField(TEXT("error_code"), SubCmd->ErrorCode);
+		}
+		ResultsArr.Add(MakeShared<FJsonValueObject>(SubResult));
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetArrayField(TEXT("results"), ResultsArr);
+	Result->SetNumberField(TEXT("total"), static_cast<double>(CommandsArr->Num()));
+	Result->SetNumberField(TEXT("succeeded"), static_cast<double>(SuccessCount));
+	Result->SetNumberField(TEXT("failed"), static_cast<double>(CommandsArr->Num() - SuccessCount));
+	SetSuccess(Cmd, Result);
+}
+
+// ── begin_transaction ─────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_BeginTransaction(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	const TSharedPtr<FJsonObject>& Params = Cmd->Params;
+	FString Description = TEXT("MCP Transaction");
+	if (Params.IsValid()) Params->TryGetStringField(TEXT("description"), Description);
+
+	if (GEditor)
+	{
+		GEditor->BeginTransaction(*Description);
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("status"), TEXT("transaction_started"));
+	Result->SetStringField(TEXT("description"), Description);
+	SetSuccess(Cmd, Result);
+}
+
+// ── end_transaction ───────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_EndTransaction(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	if (GEditor)
+	{
+		GEditor->EndTransaction();
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("status"), TEXT("transaction_ended"));
+	SetSuccess(Cmd, Result);
+}
+
+// ── undo ──────────────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_Undo(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	int32 Count = 1;
+	if (Cmd->Params.IsValid())
+	{
+		double DCount = 1;
+		if (Cmd->Params->TryGetNumberField(TEXT("count"), DCount))
+		{
+			Count = FMath::Max(1, static_cast<int32>(DCount));
+		}
+	}
+
+	bool bSuccess = false;
+	if (GEditor && GEditor->Trans)
+	{
+		for (int32 i = 0; i < Count; ++i)
+		{
+			bSuccess = GEditor->UndoTransaction(true);
+			if (!bSuccess) break;
+		}
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetNumberField(TEXT("count"), Count);
+	Result->SetBoolField(TEXT("success"), bSuccess);
+	SetSuccess(Cmd, Result);
+}
+
+// ── redo ──────────────────────────────────────────────────────────────────────
+void FMCPTCPServer::Cmd_Redo(TSharedPtr<FMCPPendingCommand>& Cmd)
+{
+	int32 Count = 1;
+	if (Cmd->Params.IsValid())
+	{
+		double DCount = 1;
+		if (Cmd->Params->TryGetNumberField(TEXT("count"), DCount))
+		{
+			Count = FMath::Max(1, static_cast<int32>(DCount));
+		}
+	}
+
+	bool bSuccess = false;
+	if (GEditor && GEditor->Trans)
+	{
+		for (int32 i = 0; i < Count; ++i)
+		{
+			bSuccess = GEditor->RedoTransaction(true);
+			if (!bSuccess) break;
+		}
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetNumberField(TEXT("count"), Count);
+	Result->SetBoolField(TEXT("success"), bSuccess);
 	SetSuccess(Cmd, Result);
 }

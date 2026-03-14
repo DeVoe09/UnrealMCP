@@ -32,12 +32,12 @@ Drop it into your project's `Plugins/` folder, enable it, and connect any MCP-co
 
 ### From Source (Plugin Folder)
 
-1. Clone or download this repository into your project's `Plugins/` directory (folder name can be `UnrealMCP` or `UnrealMCPPlugin`):
+1. Clone or download this repository into your project's `Plugins/` directory:
 
 ```
 YourProject/
   Plugins/
-    UnrealMCP/          # or UnrealMCPPlugin
+    UnrealMCP/
       Source/
       UnrealMCP.uplugin
       ...
@@ -58,7 +58,7 @@ Connect with any TCP client and send:
 You should receive:
 
 ```json
-{"id":"1","success":true,"result":{"status":"pong","version":"1.1.0","engine":"5.7.0","port":55557}}
+{"id":"1","success":true,"result":{"status":"pong","version":"2.0.0","engine":"5.7.0","port":55557}}
 ```
 
 ---
@@ -315,7 +315,7 @@ RateLimitEnabled=0
 ## Project Structure
 
 ```
-Plugins/UnrealMCP/   # or UnrealMCPPlugin
+UnrealMCP/
 ├── Source/UnrealMCP/
 │   ├── Public/
 │   │   ├── MCPTCPServer.h          # Server class, command queue, protocol
